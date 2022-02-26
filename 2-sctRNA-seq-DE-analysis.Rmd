@@ -1,0 +1,474 @@
+---
+title: "2-sctRNA-seq-DE-analysis"
+author: "Keon Arbabi"
+date: "21/02/2022"
+output: html_document
+---
+
+# Setup
+```{r knitr settings}
+library(knitr)
+knitr::opts_chunk$set(
+  echo = FALSE,
+  warning=FALSE,
+  message=FALSE,
+  error = FALSE,
+  tidy = FALSE,
+  dev = c('png', 'pdf'),
+  cache = TRUE)
+
+```
+
+# Load libraries
+```{r setup, include=FALSE}
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(data.table)
+  library(plyr)
+  library(ggpubr)
+  library(limma)
+  library(edgeR)
+  library(WGCNA)
+  library(variancePartition)
+  library(DESeq2)
+  library(parallel)
+  library(BiocParallel)
+  library(readxl)
+  library(genefilter)
+  library(FactoMineR)
+  library(umap)
+  library(Rtsne)
+  library(gridExtra)
+  library(cowplot)
+})
+
+# for parallel processing
+ncores = detectCores()
+param = SnowParam(ncores, "SOCK", progressbar = TRUE)
+
+```
+
+# Functions 
+```{r}
+
+# source: https://seqqc.wordpress.com/2020/02/17/removing-low-count-genes-for-rna-seq-downstream-analysis/
+# keeps genes that have at least min.count reads in a minimum proportion of samples given by N,
+# evaluates to ‘TRUE’ if >=90% of the samples have count-per-million (CPM) above k, where k is determined by the default value of min.count=10 and by the sample library
+
+selectGenes = function(counts, min.count=10, N=0.90){
+ 
+  lib.size = colSums(counts)
+  MedianLibSize = median(lib.size)
+  CPM.Cutoff = min.count / MedianLibSize*1e6
+  CPM = edgeR::cpm(counts,lib.size=lib.size)
+ 
+  min.samples = round(N * ncol(counts))
+ 
+  keep <- apply(CPM, 1, function(x, n = min.samples){
+   t = sum(x >= CPM.Cutoff) >= n
+   t
+  })
+  print(CPM.Cutoff)
+  return(keep)
+}
+
+# UMAP clusters
+plotUMAP = function(data, metadata, variable){
+  
+  if(ncol(data) < nrow(data)) data = t(data)
+  sample_ids = rownames(data)
+  
+  UMAP = umap(data)
+  UMAP = data.frame(ID = sample_ids, 
+                    X = UMAP$layout[,1], 
+                    Y = UMAP$layout[,2])
+  plotdata = left_join(UMAP, metadata, 'ID')
+  return(
+    ggplot(plotdata, aes(x = X, y = Y)) +
+    geom_point(aes(color = variable)) + 
+    #stat_ellipse(aes(color = DX), level = 0.3) + 
+    theme_bw() + 
+    theme(legend.position="none")
+  )
+}
+
+```
+
+# Load sctRNA-seq data 
+```{r}
+
+load("./input/PITT Tetrad (Control, MDD, BPD, SCZ) SCT-RNAseq/seFullData_5p-3bp_3p-15bp.rData")
+# load metadata
+metadata = seFullData@colData@listData %>% as.data.frame() 
+
+# make proper names 
+metadata$Cell.Type = gsub("-", "", metadata$Cell.Type)
+names(metadata)[2:5] = c("HU","CT","DX","ID")
+rownames(metadata) = metadata$ID
+
+# load count data 
+countMatrix = seFullData@assays$data@listData$counts %>% as.data.frame()
+rownames(countMatrix) = seFullData@rowRanges@partitioning@NAMES
+
+# fix sample naming issue 
+names(countMatrix)[names(countMatrix) %in% c('PV-Hu1195.bam','PV-Hu1222.bam')] = c("PVALB-Hu1195.bam", "PVALB-Hu1222.bam")
+countMatrix = countMatrix[, match(rownames(metadata), colnames(countMatrix))]
+# check
+all(rownames(metadata) == colnames(countMatrix)) 
+
+# define factors and numeric variables explicitly 
+contVars = c("Age","PMI","pH","RNA.Ratio","RIN")
+catVars = c("HU","Tetrad","CT","MOD","Sex","Race")
+metadata[,catVars] = lapply(metadata[,catVars], factor)
+metadata[,contVars] = lapply(metadata[,contVars], as.numeric)
+
+```
+
+# DESeq2 
+```{r}
+
+# set controls as reference level 
+metadata$DX = factor(metadata$DX, levels = c("Control","MDD","Bipolar","SCHIZ"), labels = c("CTRL","MDD","BD","SCZ"))
+# scale and center age 
+metadata$Age_std = scale(metadata$Age, center = TRUE)
+
+# # filter genes with reasonable expression in at least 25% of samples with each cell-type,
+# # allowing for binary (i.e. on/off) expression between the four DX conditions
+# filt_lst = dlply(metadata, .(CT), .fun = function(x){
+#   keep = selectGenes(countMatrix[,x$ID], min.count = 10, N = 0.25)
+#   names(keep[keep == TRUE])
+# })
+# # use genes that survive filtering in all cell types
+# filt_genes = Reduce(intersect, filt_lst)
+# countMatrix_filt = countMatrix[filt_genes,]
+
+# alternatively, filter for genes with more than 1 CPM in at least 20 samples
+keep = rowSums(edgeR::cpm(countMatrix) > 1) >= 19
+countMatrix_filt = countMatrix[keep,]
+
+# # or no filtering, relying completely on independent filtering by `results()` 
+# countMatrix_filt = countMatrix
+
+# perform differential expression analysis within each cell type 
+res_lst = dlply(metadata, .(CT), .fun = function(x){
+  dds = DESeqDataSetFromMatrix(countData = countMatrix_filt[,x$ID], colData = x, design = ~ Age_std + Sex + DX)
+  dds = DESeq(dds, parallel = TRUE, BPPARAM = param, quiet = TRUE)
+  
+  contrasts = resultsNames(dds)[-c(1:3)]
+  
+  tmp_lst = lapply(contrasts, function(z){
+    
+    res = results(dds, name = z, independentFiltering = F, pAdjustMethod = "BH")
+    
+    use = res$baseMean > metadata(res)$filterThreshold
+    h1 = hist(res$pvalue[!use], breaks=0:50/50, plot=FALSE)
+    h2 = hist(res$pvalue[use], breaks=0:50/50, plot=FALSE)
+    colori = c(`do not pass`="khaki", `pass`="powderblue")
+    
+    png(filename = paste0("./output/figures/independent_filtering/acrossCT_no_indpfilt_",as.character(unique(x$CT)),".png"), width = 11, height = 8, units = "in", res = 600)
+    barplot(height = rbind(h1$counts, h2$counts), beside = FALSE, col = colori, space = 0, main = "", ylab="frequency") 
+    text(x = c(0, length(h1$counts)), y = 0, label = paste(c(0,1)), adj = c(0.5,1.7), xpd=NA)
+    legend("topright", fill=rev(colori), legend=rev(names(colori)))
+    dev.off()
+    
+    res = as.data.frame(res) %>% rownames_to_column(var = "gene_ensembl")
+    res$DX = z
+    return(res)
+  })
+  res = do.call(rbind, tmp_lst)
+  return(res)
+})
+names(res_lst) = unique(metadata$CT)
+saveRDS(res_lst, file = "./output/res_lst_deseq2_acrossCT_no_indpfilt.rds")
+
+# combine and clean
+res_df = bind_rows(res_lst, .id = "cell_type") %>% 
+  relocate(DX, .after = "cell_type") %>% 
+  relocate(gene_ensembl, .before = "cell_type") %>%
+  dplyr::rename(log2fc = "log2FoldChange") %>%
+  tidyr::separate(DX, c("x1","DX","x2","x3"), "_") %>%
+  dplyr::select(-c("x1","x2","x3"))
+write.csv(res_df, file = "./output/res_df_deseq2_acrossCT_no_indpfilt.csv")
+
+# check distribution and median of unadjusted p-values 
+png(filename = "./output/figures/deseq2_phist_acrossCT_no_indpfilt.png", width = 11, height = 8, units = "in", res = 600)
+hist(res_df$pvalue)
+dev.off()
+median(res_df$pvalue, na.rm = T)
+
+# count and plot DE genes per cell type and DX group
+plot_df = res_df %>%
+  group_by(cell_type, DX) %>% 
+  mutate(de_gene_count = sum(padj < 0.1, na.rm = T)) %>%
+  distinct(de_gene_count)
+
+png(filename = "./output/figures/deseq2_degs_acrossCT_no_indpfilt.png", width = 9, height = 6, units = "in", res = 600)
+ggplot(plot_df, aes(x = cell_type, y = de_gene_count, fill = cell_type)) +
+  geom_bar(stat = "identity") +
+  theme_minimal() +
+  coord_flip() +
+  facet_wrap(~DX, ncol = 1) 
+dev.off()
+
+```
+
+# limma-voom
+```{r, fig.width= 4}
+
+# set controls as reference level 
+metadata$DX = factor(metadata$DX, levels = c("Control","MDD","Bipolar","SCHIZ"), labels = c("CTRL","MDD","BD","SCZ"))
+# scale and center age 
+metadata$Age_std = scale(metadata$Age, center = TRUE)
+
+# filter genes with reasonable expression in at least xx% of samples with each cell-type,
+# allowing for binary (i.e. on/off) expression between the four DX conditions
+filt_lst = dlply(metadata, .(CT), .fun = function(x){
+  keep = selectGenes(countMatrix[,x$ID], min.count = 10, N = 0.75)
+  names(keep[keep == TRUE])
+})
+# use genes that survive filtering in all cell types
+filt_genes = Reduce(intersect, filt_lst)
+countMatrix_filt = countMatrix[filt_genes,]
+
+# alternatively, filter for genes with more than 1 CPM in at least 20 samples
+keep = rowSums(edgeR::cpm(countMatrix) > 1) >= 19
+countMatrix_filt = countMatrix[keep,]
+
+# check logCPM before and after filtering in one random sample
+par(mfrow=c(1,2))
+x = sample(1:ncol(countMatrix),1)
+plot(density(cpm(countMatrix,log=TRUE)[,x]), main="before filtering", xlab="log CPM")
+plot(density(cpm(countMatrix_filt,log=TRUE)[,x]), main="after filtering", xlab="log CPM")
+
+# # check clustering before (left) and after (right) filtering within each cell-type
+# plot_lst = dlply(metadata, .(CT), .fun = function(x){
+#   p1 = plotUMAP(countMatrix[,x$ID], x, ID)
+#   p2 = plotUMAP(countMatrix_filt[,x$ID], x, ID)
+#   plot_grid(p1, p2, nrow = 1)
+# })
+# do.call("grid.arrange", c(plot_lst, ncol=1))
+
+# perform differential expression analysis within each cell type 
+res_lst = dlply(metadata, .(CT), .fun = function(x){
+  
+  dge = DGEList(countMatrix_filt[x$ID], group = x$DX)
+  dge = calcNormFactors(dge, method = "TMM")
+  
+  design = model.matrix(~ 0 + DX + Age_std + Sex, x)
+  contrs = makeContrasts(DXMDD = DXMDD-DXCTRL,
+                        DXBD = DXBD-DXCTRL,
+                        DXSCZ = DXSCZ-DXCTRL,
+                        levels = colnames(design))
+  
+  par(mfrow=c(1,2))
+  
+  vm = voom(dge, design, plot = TRUE)
+  #vm = voomWithQualityWeights(dge, design, plot = TRUE)
+  
+  fit = lmFit(vm, design)
+  fit = contrasts.fit(fit, contrs)
+  fit = eBayes(fit)
+  plotSA(fit, main = "Final model: Mean-variance trend")
+  
+  print(as.character(unique(x$CT)))
+  print(summary(decideTests(fit, p.value = 0.05, adjust.method = "holm")))
+  
+  contrasts = colnames(contrs)
+  tmp_lst = lapply(contrasts, function(x){
+    res = topTable(fit, coef = x, sort = "none", n = Inf, adjust.method = "BH") %>% rownames_to_column(var = "gene_ensembl")
+    res$DX = x
+    return(res)
+  })
+  res = do.call(rbind, tmp_lst)
+  return(res)
+})
+names(res_lst) = unique(metadata$CT)
+#saveRDS(res_lst, file = "./output/res_lst_limma_acrossCT.rds")
+
+# combine and clean 
+res_df = bind_rows(res_lst, .id = "cell_type") %>% 
+  relocate(DX, .after = "cell_type") %>% 
+  relocate(gene_ensembl, .before = "cell_type") %>%
+  dplyr::rename(log2fc = "logFC", 
+                pvalue = "P.Value",
+                padj = "adj.P.Val") %>%
+  mutate(DX = substring(DX, 3, nchar(DX)))
+#write.csv(res_df, file = "./output/res_df_limma_acrossCT.csv")
+
+# check distribution and median of unadjusted p-values 
+png(filename = "./output/figures/limma_phist_acrossCT.png", width = 11, height = 8, units = "in", res = 600)
+hist(res_df$pvalue)
+dev.off()
+median(res_df$pvalue, na.rm = T)
+# count and plot DE genes per cell type and DX group
+plot_df = res_df %>%
+  group_by(cell_type, DX) %>% 
+  mutate(de_gene_count = sum(padj < 0.1, na.rm = T)) %>%
+  distinct(de_gene_count)
+
+png(filename = "./output/figures/limma_degs_acrossCT.png", width = 11, height = 8, units = "in", res = 600)
+ggplot(plot_df, aes(x = cell_type, y = de_gene_count, fill = cell_type)) +
+  geom_bar(stat = "identity") +
+  theme_minimal() +
+  coord_flip() +
+  facet_wrap(~DX, ncol = 1) 
+dev.off()
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# Compare with Dwight's analysis  
+```{r, fig.width=4}
+
+# load DESeq2 results calculated above
+res_df = read.csv(file = "./output/res_df_deseq2.csv")[,-1] %>%
+  tidyr::unite("match_id", gene_ensembl:cell_type:DX, sep = "_", remove = FALSE)
+
+# load in the tetrad contrasts excel file 
+tetrad_contrasts = read_excel("./input/PITT Tetrad (Control, MDD, BPD, SCZ) SCT-RNAseq/PITT_tetrad_cohort_SCT_contrasts.xlsx")
+tetrad_contrasts_headers = read_excel("./input/PITT Tetrad (Control, MDD, BPD, SCZ) SCT-RNAseq/PITT_tetrad_cohort_SCT_contrasts.xlsx", n_max = 2, col_names = F)
+
+cell_types = c("PyrL2n3","PyrL5n6","PVALB","SST","VIP")
+comparisons = c('MDD', 'BD', 'SCZ')
+gen_col_names = c('log2fc', 'pvalue', 'padj')
+
+new_contrast_col_names = lapply(comparisons, function(comparison){
+  lapply(cell_types, function(cell_type){
+    my_str = c(paste(cell_type, comparison, 'log2fc', sep = "_"), paste(cell_type, comparison, 'pvalue', sep = "_"), paste(cell_type, comparison, 'padj', sep = "_"))
+    return(my_str)
+  }) %>% unlist()
+}) %>% unlist()
+
+tetrad_contrasts = tetrad_contrasts[-c(1,2),]
+tetrad_contrasts[,-c(1:2)] = lapply(tetrad_contrasts[,-c(1:2)], function(x){
+   as.numeric(as.character(x))
+})
+tetrad_contrasts[tetrad_contrasts == "NA"] = NA
+colnames(tetrad_contrasts) = c('gene_ensembl',  'gene_symbol', new_contrast_col_names)
+
+# massage the tetrad contrasts df to put it into standard tidy format
+# this is what you need to compare output of DESeq2 / limma with Dwight's DE calls
+tetrad_contrasts_long = tetrad_contrasts %>%
+  dplyr::select(-gene_symbol) %>%
+  pivot_longer(!gene_ensembl, names_to = 'assay', values_to = 'value') %>%
+  tidyr::separate(assay, c('cell_type', 'DX', 'assay'), '_') %>% 
+  pivot_wider(id_cols = c(gene_ensembl, cell_type, DX), names_from = assay, values_from = value) %>% 
+  tidyr::unite("match_id", gene_ensembl:cell_type:DX, sep = "_", remove = FALSE)
+
+# combine with present DE analysis and check logfc correlations between genes 
+plot_df = merge(res_df, tetrad_contrasts_long %>% dplyr::select(c(match_id, log2fc)), by = "match_id")
+
+ggplot(plot_df, aes(log2fc.x, log2fc.y)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE) +
+  geom_abline(slope = 1, intercept = 0, color = "red") +
+  theme_minimal() +
+  facet_wrap(~cell_type + DX, scales = "free")
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

@@ -48,22 +48,22 @@ countMatrix = countMatrix[, match(rownames(metadata), colnames(countMatrix))]
 all(rownames(metadata) == colnames(countMatrix)) 
 
 # filter genes by expression 
-isexpr = rowSums(edgeR::cpm(countMatrix)>0.1) >= 120
+isexpr = rowSums(edgeR::cpm(countMatrix)>0.1) >= 130
 # normalize 
 geneExpr = DGEList(countMatrix[isexpr,] )
 geneExpr = calcNormFactors(geneExpr, "none") # TMM
 
 # convert factors 
 contVars = c("Age","PMI","pH","RNA.Ratio","RIN")
-catVars = c("Tetrad","HU","CT","Subject.Group","MOD","Sex","Race")
+catVars = c("HU","Tetrad","CT","Subject.Group","MOD","Sex","Race")
 metadata[,catVars] = lapply(metadata[,catVars], factor)
 
-form = ~ 0 + CT + Subject.Group + Sex + scale(Age) + scale(PMI) + scale(RIN) 
-# ideally we would used a mixed-effects model...
-#form = ~ 0 + CT + Subject.Group + Sex + scale(Age) + scale(PMI) + scale(RIN) + (1|HU)
+form = ~ CT + Subject.Group + CT*Subject.Group + scale(Age) + Sex + (1|HU)
 
 vobj = voomWithDreamWeights(geneExpr, form, metadata, save.plot = T, BPPARAM = param)
 plot(vobj)
+fitExtractVarPartModel(vobj_dream, form, METADATA)
+
 # compare each cell-type to all others 
 L = makeContrastsDream(form, metadata, 
                        contrasts = c(PVALB = "CTPVALB - (CTPyrL2n3 + CTPyrL5n6 + CTSST + CTVIP)/4",
@@ -100,4 +100,96 @@ for(i in 1:length(cts)){
 names(resLst) = cts
 
 saveRDS(resLst, file = "C:/Users/arbabik/Downloads/resLst.rds")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# form = ~ 0 + CT + Subject.Group + Sex + scale(Age) + scale(PMI) + scale(RIN) 
+# # ideally we would used a mixed-effects model...
+# #form = ~ 0 + CT + Subject.Group + Sex + scale(Age) + scale(PMI) + scale(RIN) + (1|HU)
+# 
+# vobj = voomWithDreamWeights(geneExpr, form, metadata, save.plot = T, BPPARAM = param)
+# plot(vobj)
+# # compare each cell-type to all others 
+# L = makeContrastsDream(form, metadata, 
+#                        contrasts = c(PVALB = "CTPVALB - (CTPyrL2n3 + CTPyrL5n6 + CTSST + CTVIP)/4",
+#                                      PyrL2n3 = "CTPyrL2n3 - (CTPVALB + CTPyrL5n6 + CTSST + CTVIP)/4",
+#                                      PyrL5n6 = "CTPyrL5n6 - (CTPVALB + CTPyrL2n3 + CTSST + CTVIP)/4",
+#                                      SST = "CTSST - (CTPVALB + CTPyrL2n3 + CTPyrL5n6 + CTVIP)/4",
+#                                      VIP = "CTVIP - (CTPVALB + CTPyrL2n3 + CTPyrL5n6 + CTSST)/4"))
+# plotContrasts(L)
+# # fit model for each gene 
+# fit = dream(vobj, form, metadata, L)
+# fit = eBayes(fit)
+# 
+# # Get background genes 
+# backgroundGenes = data.frame(ensembl_gene_id = rownames(countMatrix))
+# # Define biomart object
+# mart = biomaRt::useMart(biomart = "ENSEMBL_MART_ENSEMBL",
+#                         host = "uswest.ensembl.org",
+#                         dataset = "hsapiens_gene_ensembl")
+# # Query biomart
+# Ensemble2HGNC = biomaRt::getBM(attributes = c("ensembl_gene_id", "hgnc_symbol", "percentage_gene_gc_content", "gene_biotype", "chromosome_name"),
+#                                filters = "ensembl_gene_id", 
+#                                values = backgroundGenes$ensembl_gene_id,
+#                                mart = mart)
+# # get DE genes 
+# resLst = list()
+# cts = c("PVALB", "PyrL2n3", "PyrL5n6", "SST", "VIP")
+# 
+# for(i in 1:length(cts)){
+#   resLst[[i]] = topTable(fit, coef = cts[i], number = Inf) %>%
+#     rownames_to_column(var = 'ensembl_gene_id') %>% 
+#     left_join(backgroundGenes) %>% 
+#     left_join(Ensemble2HGNC) 
+# }
+# names(resLst) = cts
+# 
+# saveRDS(resLst, file = "C:/Users/arbabik/Downloads/resLst.rds")
 

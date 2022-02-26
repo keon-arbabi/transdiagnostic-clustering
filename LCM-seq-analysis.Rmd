@@ -1,0 +1,193 @@
+---
+title: "LCM-seq-analysis"
+author: "Keon Arbabi"
+date: "24/02/2022"
+output: html_document
+---
+
+# Setup
+```{r knitr settings}
+library(knitr)
+knitr::opts_chunk$set(
+  echo = FALSE,
+  warning=FALSE,
+  message=FALSE,
+  error = FALSE,
+  tidy = FALSE,
+  dev = c('png', 'pdf'),
+  cache = TRUE)
+
+```
+
+# Load libraries
+```{r setup, include=FALSE}
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(data.table)
+  library(plyr)
+  library(ggpubr)
+  library(limma)
+  library(edgeR)
+  library(WGCNA)
+  library(variancePartition)
+  library(DESeq2)
+  library(parallel)
+  library(BiocParallel)
+  library(readxl)
+  library(genefilter)
+  library(FactoMineR)
+  library(umap)
+  library(Rtsne)
+  library(gridExtra)
+  library(cowplot)
+})
+
+# load functions 
+source(file = "./LCM-seq-functions.R")
+
+# for parallel processing
+ncores = detectCores()
+param = SnowParam(ncores, "SOCK", progressbar = TRUE)
+
+```
+
+# Load LCM-seq data 
+```{r}
+
+load("./input/PITT Tetrad (Control, MDD, BPD, SCZ) SCT-RNAseq/seFullData_5p-3bp_3p-15bp.rData")
+# load metadata
+metadata = seFullData@colData@listData %>% as.data.frame() 
+
+# make proper names 
+metadata$Cell.Type = gsub("-", "", metadata$Cell.Type)
+names(metadata)[2:5] = c("HU","CT","DX","ID")
+rownames(metadata) = metadata$ID
+
+# load count data 
+countMatrix = seFullData@assays$data@listData$counts %>% as.data.frame()
+rownames(countMatrix) = seFullData@rowRanges@partitioning@NAMES
+
+# fix sample naming issue 
+names(countMatrix)[names(countMatrix) %in% c('PV-Hu1195.bam','PV-Hu1222.bam')] = c("PVALB-Hu1195.bam", "PVALB-Hu1222.bam")
+countMatrix = countMatrix[, match(rownames(metadata), colnames(countMatrix))]
+# check
+all(rownames(metadata) == colnames(countMatrix)) 
+
+# define factors and numeric variables explicitly 
+contVars = c("Age","PMI","pH","RNA.Ratio","RIN")
+catVars = c("HU","Tetrad","CT","MOD","Sex","Race")
+metadata[,catVars] = lapply(metadata[,catVars], factor)
+metadata[,contVars] = lapply(metadata[,contVars], as.numeric)
+
+```
+
+# Explore data 
+```{r}
+
+# plot library sizes across samples 
+dge0 = DGEList(countMatrix)
+barplot(dge0$samples$lib.size/1e06, names = colnames(dge0), las = 2, ann = FALSE, cex.names = 0.75)
+mtext(side = 1, text = "Samples", line = 4)
+mtext(side = 2, text = "Library size (millions)", line = 3)
+title("Barplot of library sizes")
+
+# check contribution of variables 
+var = "CT"
+p1 = plotDims(countMatrix, metadata, var, "UMAP", legend = T)
+p2 = plotDims(countMatrix, metadata, var, "PCA", legend = T)
+p3 = plotDims(countMatrix, metadata, var, "TSNE", legend = T)
+ggarrange(p1, p2, p3, nrow = 1, common.legend = T)
+ggsave(filename = paste0("./output/figures/qc/dimplots_all_", var, ".jpeg"), width = 9, height = 5)
+
+```
+
+# Filter genes and remove outlier samples 
+```{r, fig.width=2.5, fig.height= 3}
+# set controls as reference level 
+metadata$DX = factor(metadata$DX, levels = c("Control","MDD","Bipolar","SCHIZ"), labels = c("CTRL","MDD","BD","SCZ"))
+# scale and center age 
+metadata$Age_std = scale(metadata$Age, center = TRUE)
+
+# filter genes with reasonable expression in at least 25% of samples with each cell-type,
+# allowing for binary (i.e. on/off) expression between the four DX conditions
+filt_lst = dlply(metadata, .(CT), .fun = function(x){
+  keep = selectGenes(countMatrix[,x$ID], min.count = 10, N = 0.5)
+  names(keep[keep == TRUE])
+})
+# use genes that survive filtering in all cell types
+filt_genes = Reduce(intersect, filt_lst)
+countMatrix_filt = countMatrix[filt_genes,]
+
+# for all counts data, filter for genes with the CPM equivalent of more than 10 counts in
+# at least 19 samples (smallest subgroup of samples; one disorder within one cell-type)
+keep = selectGenes(countMatrix, min.count = 10, N = 0.7)
+countMatrix_filt = countMatrix[keep,]
+
+hist(unlist(countMatrix_filt))
+
+# for each cell type, hierarchically cluster to identify outlier samples 
+cut_lst = dlply(metadata, .(CT), .fun = function(x){
+  plotClusters(countMatrix_filt[,x$ID], x, 4, "mcquitty")
+})
+# remove outlier samples identified by clustering 
+rm_samps = c("Pyr-L5n6-Hu1044.bam","Pyr-L2n3-Hu1044.bam","Pyr-L2n3-Hu1341.bam","Pyr-L2n3-Hu1444.bam")
+countMatrix_filt = select(countMatrix_filt, -rm_samps)
+metadata_filt = metadata[!rownames(metadata) %in% rm_samps,]
+
+```
+
+# Limma-voom
+```{r, fig.width=4, fig.height=2.5}
+# run custom limma-voom
+res_lst_limma = LimmaVoom(countMatrix_filt, metadata_filt, p.adjust.method = "BH")
+#saveRDS(res_lst_limma, file = "./output/res_lst_limma_acrossCT.rds")
+
+```
+
+```{r}
+# combine and clean 
+res_df_limma = bind_rows(res_lst_limma, .id = "cell_type") %>% 
+  relocate(DX, .after = "cell_type") %>% 
+  relocate(gene_ensembl, .before = "cell_type") %>%
+  dplyr::rename(log2fc = "logFC", pvalue = "P.Value", padj = "adj.P.Val") %>%
+  mutate(DX = substring(DX, 3, nchar(DX)))
+#write.csv(res_df_limma, file = "./output/res_df_limma_withinCT.csv")
+
+# check distribution and median of unadjusted p-values 
+#png(filename = "./output/figures/limma_phist_withinCT.png", width = 11, height = 8, units = "in", res = 600)
+hist(res_df_limma$pvalue)
+#dev.off()
+
+median(res_df_limma$pvalue, na.rm = T)
+
+# count and plot DE genes per cell type and DX group
+plot_df = res_df_limma %>%
+  group_by(cell_type, DX) %>% 
+  mutate(de_gene_count = sum(padj < 0.1, na.rm = T)) %>%
+  distinct(de_gene_count)
+
+#png(filename = "./output/figures/limma_degs_withinCT.png", width = 11, height = 8, units = "in", res = 600)
+ggplot(plot_df, aes(x = cell_type, y = de_gene_count, fill = cell_type)) +
+  geom_bar(stat = "identity") +
+  theme_minimal() +
+  coord_flip() +
+  facet_wrap(~DX, ncol = 1) 
+#dev.off()
+
+```
+
+# EdgeR-LRT
+```{r, fig.width=4, fig.height=2.5}
+# run custom edgeR
+res_lst_edger = EdgeRLRT(countMatrix_filt, metadata_filt, p.adjust.method = "BH")
+saveRDS(res_lst_edger, file = "./output/res_lst_edger_acrossCT.rds")
+
+```
+
+
+
+
+
+
+
