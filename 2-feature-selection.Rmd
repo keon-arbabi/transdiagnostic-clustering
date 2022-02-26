@@ -1,0 +1,432 @@
+---
+title: "2-feature-selection"
+author: "Keon Arbabi"
+date: "28/01/2022"
+output: html_document
+---
+
+### Setup
+```{r knitr settings}
+library(knitr)
+knitr::opts_chunk$set(
+  echo = FALSE,
+  warning=FALSE,
+  message=FALSE,
+  error = FALSE,
+  tidy = FALSE,
+  dev = c('png', 'pdf'),
+  cache = TRUE)
+
+```
+
+### Load libraries
+```{r setup, include=FALSE}
+suppressPackageStartupMessages({
+
+  library(tidyverse)
+  library(data.table)
+  library(compositions)
+  library(kableExtra)
+  library(plyr)
+  library(cowplot)
+  library(gridExtra)
+  library(ggpubr)
+  library(FactoMineR)
+  library(umap)
+  library(Rtsne)
+  library(factoextra)
+  library(limma)
+  library(edgeR)
+  library(variancePartition)
+}) 
+
+#source("./common_functions/common_functions.R")
+
+colorArray = colors()[grep("grey|gray", colors(), invert=TRUE)]
+
+```
+
+### Functions
+```{r}
+
+# plot PCA, UMPA, and TSNE clusters
+# show Institution and Dx
+check_clusters = function(data, metadata){
+  if(ncol(data) < nrow(data)) data = t(data)
+  sample_ids = rownames(data)
+  res_list = list(PCA = PCA(data, scale.unit = T, graph = F),
+                  UMAP = umap(data),
+                  TSNE = Rtsne(data)
+                  )
+  plot_list = list(PCA = data.frame(SampleID = sample_ids,
+                                    X = res_list$PCA$ind$coord[,1], 
+                                    Y = res_list$PCA$ind$coord[,2]), 
+                   UMAP = data.frame(SampleID = sample_ids,
+                                     X = res_list$UMAP$layout[,1],
+                                     Y = res_list$UMAP$layout[,2]),
+                   TSNE = data.frame(SampleID = sample_ids,
+                                     X = res_list$TSNE$Y[,1],
+                                     Y = res_list$TSNE$Y[,2])
+                   )
+  plots = lapply(plot_list, function(l){
+    plotdata = left_join(l, metadata, 'SampleID')
+    p = ggplot(plotdata, aes(x = X, y = Y))
+    p1 = p + geom_point(aes(color = Institution)) + stat_ellipse(aes(color = Institution), level = 0.3) + theme_bw() + theme(legend.position="right") 
+    p2 = p + geom_point(aes(color = Dx))  + stat_ellipse(aes(color = Dx), level = 0.3) + theme_bw() + theme(legend.position="right") 
+    plot_grid(p1, p2, nrow = 1)
+  })
+  do.call("grid.arrange", c(plots, ncol=1))
+}
+
+```
+
+### Load data
+```{r, fig.height = 8, fig.width = 6}
+
+# load in data
+METADATA = readRDS(file = "./output/METADATA.rds") 
+geneCountsMerged = readRDS(file = "./output/geneCountsMerged.rds") 
+# check
+all(rownames(METADATA) == colnames(geneCountsMerged)) 
+
+# svglite::svglite(file = "./output/figures/nonnormalized_clusters.svg", height = 16, width = 12)
+# check_clusters(data = geneCountsMerged, metadata = METADATA)
+# dev.off()
+
+```
+
+### Normalize     
+```{r}
+# filter genes
+isexpr.lst = dlply(METADATA, .(Cohort), .fun = function(mtd){
+	rowSums(cpm(geneCountsMerged[,mtd$SampleID])>.5) >= .3*ncol(geneCountsMerged[,mtd$SampleID])
+	})
+isexpr = do.call(rbind, isexpr.lst)
+# keep gene expressed in both cohorts 
+isexpr = colSums(isexpr) == 2 
+table(isexpr)
+   
+# normalize each cohort separately
+dge.lst = lapply(levels(METADATA$Cohort), function(Cohort){
+  # normalize counts
+  dge = DGEList(geneCountsMerged[isexpr,METADATA$Cohort==Cohort])
+  calcNormFactors(dge, "none") # TMM
+})
+names(dge.lst) = levels(METADATA$Cohort)
+
+# svglite::svglite(file = "./output/figures/normalizedcounts_clusters.svg", height = 16, width = 12)
+# temp = cbind(dge.lst$`MSSM-Penn-Pitt`$counts, dge.lst$`NIMH-HBCC`$counts)
+# check_clusters(data = temp, metadata = METADATA)
+# dev.off()
+
+```
+
+### Differential expression testing 
+```{r}
+
+# formulas 
+# add interaction of institution for MSSM-Penn-Pitt
+form.lst = list(
+  `MSSM-Penn-Pitt` = ~ 0 + Dx + Reported_Gender + RIN +scale(IntronicRate) + scale(IntragenicRate) + scale(IntergenicRate) + scale(rRNARate) + 
+   Institution*(ageOfDeath + cellFrac_ilr_1 + cellFrac_ilr_2 + cellFrac_ilr_3),
+  
+  `NIMH-HBCC` = ~ 0 + Dx + Reported_Gender + RIN + scale(IntronicRate) + scale(IntragenicRate) + scale(IntergenicRate) + scale(rRNARate) + 
+   ageOfDeath + cellFrac_ilr_1 + cellFrac_ilr_2 + cellFrac_ilr_3
+  )
+
+# dream analysis 
+fit.lst = lapply(dge.lst, function(dge){
+
+  i = match(colnames(dge), rownames(METADATA))
+  info = METADATA[i,]
+  form_use = form.lst[[info$Cohort[1]]]
+  
+  L = makeContrastsDream(form_use, info, 
+                         contrasts = c("DxBP - DxControl", "DxSCZ - DxControl", "DxSCZ - DxBP"))
+  plotContrasts(L)
+
+  vobj_dream = voomWithDreamWeights(dge, form_use, info, plot = F)
+  fit = dream(vobj_dream, form_use, info, L)
+  fit = eBayes(fit)
+
+  })
+names(fit.lst) = names(dge.lst)
+
+```
+
+### Differentially expressed genelists 
+```{r}
+
+# Get background genes 
+backgroundGenes = data.frame(gene_id = rownames(geneCountsMerged)) %>%
+  dplyr::mutate(id = gene_id) %>%
+  tidyr::separate(id, c('ensembl_gene_id','position'), sep = '\\.')
+
+# Define biomart object
+mart = biomaRt::useMart(biomart = "ENSEMBL_MART_ENSEMBL",
+                        host = "uswest.ensembl.org", # Ensembl Release 99 (January 2020)
+                        dataset = "hsapiens_gene_ensembl")
+# Query biomart
+Ensemble2HGNC = biomaRt::getBM(attributes = c("ensembl_gene_id", "hgnc_symbol", "percentage_gene_gc_content", "gene_biotype", "chromosome_name"),
+                               filters = "ensembl_gene_id", 
+                               values = backgroundGenes$ensembl_gene_id,
+                               mart = mart)
+# get DE genes
+DE = lapply(fit.lst, function(FIT){
+  topTable(FIT, coef = c("DxBP - DxControl", "DxSCZ - DxControl", "DxSCZ - DxBP"), number = Inf) %>%
+    rownames_to_column(var = 'gene_id') %>% 
+    left_join(backgroundGenes) %>% 
+    left_join(Ensemble2HGNC) 
+})
+de_genes = do.call(rbind, DE) %>% filter(adj.P.Val < 0.05) %>% pull(gene_id) %>% unique()
+
+# svglite::svglite(file = "./output/figures/featureselected_clusters.svg", height = 16, width = 12)
+# check_clusters(data = geneCountsMerged[de_genes,], metadata = METADATA)
+# dev.off()
+
+```
+
+### Variance explained by each term
+```{r}
+
+# combine normalized counts 
+dge.comb = cbind(dge.lst$`NIMH-HBCC`$counts,
+                 dge.lst$`MSSM-Penn-Pitt`$counts)
+
+form = ~ Dx + Reported_Gender + RIN +scale(IntronicRate) + scale(IntragenicRate) + scale(IntergenicRate) + scale(rRNARate) +
+  Institution*(ageOfDeath + cellFrac_ilr_1 + cellFrac_ilr_2 + cellFrac_ilr_3)
+
+vobj_dream = voomWithDreamWeights(dge.comb, form, METADATA, plot = F)
+vp = fitExtractVarPartModel(vobj_dream, form, METADATA)
+
+svglite::svglite(file = "./output/figures/residualsacross_variance.svg", height = 10, width = 15)
+plotVarPart(sortCols(vp))
+dev.off()
+
+```
+
+### Residualize 
+```{r}
+
+# within cohorts 
+form.lst = list(
+  `MSSM-Penn-Pitt` = ~ Reported_Gender + RIN +scale(IntronicRate) + scale(IntragenicRate) + scale(IntergenicRate) + scale(rRNARate) + 
+   Institution*(ageOfDeath + cellFrac_ilr_1 + cellFrac_ilr_2 + cellFrac_ilr_3),
+  
+  `NIMH-HBCC` = ~ Reported_Gender + RIN + scale(IntronicRate) + scale(IntragenicRate) + scale(IntergenicRate) + scale(rRNARate) + 
+   ageOfDeath + cellFrac_ilr_1 + cellFrac_ilr_2 + cellFrac_ilr_3
+  )
+
+residuals.lst = lapply(dge.lst, function(dge){
+  
+  i = match(colnames(dge), rownames(METADATA))
+  info = METADATA[i,]
+  form_use = form.lst[[info$Cohort[1]]]
+  
+  vobj_dream = voomWithDreamWeights(dge, form_use, info, plot = F)
+  fit = dream(vobj_dream, form_use, info, computeResiduals = TRUE)
+  
+  residuals(fit, dge)
+})
+
+RESIDUAL.GENE_EXPRESSION = t(do.call(cbind, residuals.lst))
+RESIDUAL.GENE_EXPRESSION = RESIDUAL.GENE_EXPRESSION[match(METADATA$SampleID, rownames(RESIDUAL.GENE_EXPRESSION)),]
+
+svglite::svglite(file = "./output/figures/residualswithin_clusters.svg", height = 16, width = 12)
+check_clusters(data = RESIDUAL.GENE_EXPRESSION, metadata = METADATA)
+dev.off()
+
+# combined cohorts 
+form = ~ Reported_Gender + RIN +scale(IntronicRate) + scale(IntragenicRate) + scale(IntergenicRate) + scale(rRNARate) +
+  Institution*(ageOfDeath + cellFrac_ilr_1 + cellFrac_ilr_2 + cellFrac_ilr_3)
+
+vobj_dream = voomWithDreamWeights(dge.comb, form, METADATA, plot = F)
+fit = dream(vobj_dream, form, METADATA, computeResiduals = TRUE)
+
+RESIDUAL.GENE_EXPRESSION = residuals(fit)
+
+svglite::svglite(file = "./output/figures/residualsacross_featureselected_clusters.svg", height = 16, width = 12)
+check_clusters(data = RESIDUAL.GENE_EXPRESSION[de_genes,], metadata = METADATA)
+dev.off()
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```{r}
+
+# # load in data
+# METADATA = readRDS(file = "./output/METADATA.rds") 
+# geneCountsMerged = readRDS(file = "./output/geneCountsMerged.rds") 
+# 
+# # Set variable class
+# FactorCovariates = c("IndividualID", "Reported_Gender", "LibraryBatch", "Dx", "RibozeroBatch", "FlowcellBatch")
+# COVARIATES = METADATA %>% filter(Institution == "NIMH-HBCC")
+# COVARIATES[,FactorCovariates] = lapply(COVARIATES[,FactorCovariates], factor)
+# ContCovariates = c("ageOfDeath", "PMI", "RIN", "MappedReads", "IntragenicRate", "IntronicRate", "IntergenicRate",
+#                     "GenesDetected", "ExpProfEfficiency", "rRNARate", "TotalReads","AlignmentRate", 
+#                     "EV.1", "EV.2", "EV.3", "EV.4", "EV.5")
+# COVARIATES[,ContCovariates] = lapply(COVARIATES[,ContCovariates], function(x){
+#   x = as.numeric(as.character(gsub('[\\,\\%]','',x)))
+# })
+# # Set covariates to adjust for from model selection
+# interaction = c("Dx")
+# adjust.covars = c("Reported_Gender", "ageOfDeath", "RIN", "IntronicRate", "IntragenicRate", "IntergenicRate")
+# 
+# col_type = dplyr::select(COVARIATES, c(adjust.covars)) %>%
+#   dplyr::summarise_all(class) %>% 
+#   tidyr::gather(variable, class)
+# 
+# # Scale continuous variables
+# adjust.covars = sapply(1:length(col_type$class), function(i){
+#   switch(col_type$class[i], 
+#     "factor" = paste0(col_type$variable[i]),
+#     "numeric" = paste0('scale(', col_type$variable[i], ')')
+#   )
+#   })
+# 
+# # Adjusted formula
+# formula = glue::glue("~ ", glue::glue_collapse(interaction, sep = "*")," + ", glue::glue_collapse(adjust.covars, sep = " + "))    
+# formula
+# 
+# # Estimate voom weights with DREAM
+# NEW.COUNTS = geneCountsMerged %>% dplyr::select(COVARIATES$SampleID)
+# geneExpr = DGEList(NEW.COUNTS)
+# geneExpr = edgeR::calcNormFactors(geneExpr)
+# 
+# VOOM.GENE_EXPRESSION = variancePartition::voomWithDreamWeights(counts = geneExpr, 
+#                                                                formula = formula,
+#                                                                data = COVARIATES,
+#                                                                save.plot = TRUE)
+# 
+# # Fit linear model using new weights and new design
+# VOOM.GENE_EXPRESSION$E = NEW.COUNTS
+# ADJUSTED.FIT = variancePartition::dream(exprObj = VOOM.GENE_EXPRESSION,
+#                                         formula = formula,
+#                                         data = COVARIATES,
+#                                         computeResiduals = TRUE)
+# # Model categorical variables as random to report variance fractions
+# formula_for_variance_fractions = sapply(1:length(col_type$class), function(i){
+#   switch(col_type$class[i], 
+#     "factor" = paste0('(1|', col_type$variable[i], ')'),
+#     "numeric" = paste0('scale(', col_type$variable[i], ')')
+#   )
+#   })
+
+```
+
+
+
+
+
+
+
+
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
