@@ -36,6 +36,8 @@ suppressPackageStartupMessages({
   library(Rtsne)
   library(gridExtra)
   library(cowplot)
+  library(MASS)
+  library(viridis)
 })
 
 # load functions 
@@ -60,14 +62,26 @@ names(metadata)[2:5] = c("HU","CT","DX","ID")
 rownames(metadata) = metadata$ID
 
 # load count data 
-countMatrix = seFullData@assays$data@listData$counts %>% as.data.frame()
-rownames(countMatrix) = seFullData@rowRanges@partitioning@NAMES
+counts_matrix = seFullData@assays$data@listData$counts %>% as.data.frame()
+rownames(counts_matrix) = seFullData@rowRanges@partitioning@NAMES
+
+# get gene symbols and keep separately
+mart = biomaRt::useMart(biomart = "ensembl", dataset = "hsapiens_gene_ensembl")
+ensembl = biomaRt::getBM(attributes = c("ensembl_gene_id", "hgnc_symbol"), values = rownames(counts_matrix), mart = mart)
+names(ensembl) = c("gene_ensembl","gene_symbol")
+# remove unwanted genes 
+rm_genes = ensembl %>% dplyr::filter(str_detect(gene_symbol, "^LOC|^MT-|^RP[0-9]|^BC[0-9]|-PS")) %>% pull(gene_ensembl)
+counts_matrix = counts_matrix[!row.names(counts_matrix) %in% rm_genes,]
+# get only protein coding genes 
+protein_genes = biomaRt::getBM(attributes = c("ensembl_gene_id", "gene_biotype"), filters = c("ensembl_gene_id", "biotype"), values = list(row.names(counts_matrix),"protein_coding"), mart = mart)
+protein_genes = intersect(row.names(counts_matrix), protein_genes$ensembl_gene_id)
+counts_matrix = counts_matrix[protein_genes,]
 
 # fix sample naming issue 
-names(countMatrix)[names(countMatrix) %in% c('PV-Hu1195.bam','PV-Hu1222.bam')] = c("PVALB-Hu1195.bam", "PVALB-Hu1222.bam")
-countMatrix = countMatrix[, match(rownames(metadata), colnames(countMatrix))]
+names(counts_matrix)[names(counts_matrix) %in% c('PV-Hu1195.bam','PV-Hu1222.bam')] = c("PVALB-Hu1195.bam", "PVALB-Hu1222.bam")
+counts_matrix = counts_matrix[, match(rownames(metadata), colnames(counts_matrix))]
 # check
-all(rownames(metadata) == colnames(countMatrix)) 
+all(rownames(metadata) == colnames(counts_matrix)) 
 
 # define factors and numeric variables explicitly 
 contVars = c("Age","PMI","pH","RNA.Ratio","RIN")
@@ -75,66 +89,95 @@ catVars = c("HU","Tetrad","CT","MOD","Sex","Race")
 metadata[,catVars] = lapply(metadata[,catVars], factor)
 metadata[,contVars] = lapply(metadata[,contVars], as.numeric)
 
+# set controls as reference level 
+metadata$DX = factor(metadata$DX, levels = c("Control","MDD","Bipolar","SCHIZ"), labels = c("CTRL","MDD","BD","SCZ"))
+# scale and center age 
+metadata$Age_scaled = scale(metadata$Age, center = TRUE)
+
 ```
 
 # Explore data 
 ```{r}
 
-# plot library sizes across samples 
-dge0 = DGEList(countMatrix)
-barplot(dge0$samples$lib.size/1e06, names = colnames(dge0), las = 2, ann = FALSE, cex.names = 0.75)
-mtext(side = 1, text = "Samples", line = 4)
-mtext(side = 2, text = "Library size (millions)", line = 3)
-title("Barplot of library sizes")
+# perform and visualize variance stabilization before applying PCA 
+# run once
+if(F){
+  dds0 = DESeqDataSetFromMatrix(counts_matrix, metadata, design = ~ Age_scaled + Sex + DX)
+  dds0 = estimateSizeFactors(dds0)
+  dds0 = DESeq2::estimateDispersions(dds0, fitType = "parametric", quiet = TRUE)
+  
+  vsd = varianceStabilizingTransformation(dds0, blind = TRUE, fitType = "parametric") # don't take design formula into account 
+  saveRDS(vsd, file = "./output/vsd.rds")
+}
+# extract the matrix of variance stabilized counts
+vsd = read_rds(file = "./output/vsd.rds")
+variance_stabilised_counts = assay(vsd)
+
+# plot before and after variance stabilization 
+p1 = plotMeanSD(counts_matrix, stabilized = FALSE)
+p2 = plotMeanSD(variance_stabilised_counts, stabilized = TRUE)
+ggarrange(p1, p2, nrow = 1)
+ggsave(filename = "./output/figures/qc/mean_variance_plots.jpeg", width = 9, height = 5.5)
+
+# visualize un-normalized counts across groups 
+dge0 = DGEList(counts_matrix)
+counts_matrix %>%
+  rownames_to_column("gene") %>% 
+  pivot_longer(cols = - gene, names_to = "ID", values_to = "counts") %>%
+  left_join(., metadata %>% dplyr::select(c("ID","DX","CT")), by = "ID") %>%
+  ggplot(., aes(x = DX, y = log10(counts))) +
+  scale_y_continuous(trans = 'log10') +
+  geom_boxplot() + 
+  theme_classic()+
+  facet_wrap(~CT, drop = TRUE, scales = "free_x", nrow = 1)
+# save plot
+ggsave(filename = "./output/figures/qc/boxplots_unnorm_counts.jpeg", width = 10, height = 5.5)
+
+# visualize library size across groups 
+dge0$samples %>%
+  rownames_to_column("ID") %>% 
+  left_join(., metadata %>% dplyr::select(c("ID","DX","CT")), by = "ID") %>%
+  ggplot(., aes(x = DX, y = lib.size/1e06)) +
+  geom_boxplot() + 
+  scale_y_continuous(trans = 'log10') +
+  labs(y = "log10 library size (millions)") + 
+  theme_classic()+
+  facet_wrap(~CT, drop = TRUE, scales = "free_x", nrow = 1)
+# save plot
+ggsave(filename = "./output/figures/qc/boxplots_libsize.jpeg", width = 10, height = 5.5)
 
 # check contribution of variables 
 var = "CT"
-p1 = plotDims(countMatrix, metadata, var, "UMAP", legend = T)
-p2 = plotDims(countMatrix, metadata, var, "PCA", legend = T)
-p3 = plotDims(countMatrix, metadata, var, "TSNE", legend = T)
+p1 = plotDims(variance_stabilised_counts, metadata, var, "UMAP", legend = T)
+p2 = plotDims(variance_stabilised_counts, metadata, var, "PCA", legend = T)
+p3 = plotDims(variance_stabilised_counts, metadata, var, "TSNE", legend = T)
 ggarrange(p1, p2, p3, nrow = 1, common.legend = T)
 ggsave(filename = paste0("./output/figures/qc/dimplots_all_", var, ".jpeg"), width = 9, height = 5)
 
 ```
 
-# Filter genes and remove outlier samples 
+# Filter genes 
 ```{r}
-# set controls as reference level 
-metadata$DX = factor(metadata$DX, levels = c("Control","MDD","Bipolar","SCHIZ"), labels = c("CTRL","MDD","BD","SCZ"))
-# scale and center age 
-metadata$Age_std = scale(metadata$Age, center = TRUE)
+# keep genes that are expressed in at least one combination of CT and DX
+filt_lst = dlply(metadata, .(CT, DX), .fun = function(x){
+	rowSums(cpm(counts_matrix[,x$ID]) > 1) >= 0.5*ncol(counts_matrix[,x$ID])
+	})
+keep = colSums(do.call(rbind, filt_lst)) > 0 
+table(keep)
+counts_matrix_filt = counts_matrix[keep,]
 
-# filter genes with reasonable expression in at least 25% of samples with each cell-type,
-# allowing for binary (i.e. on/off) expression between the four DX conditions
-filt_lst = dlply(metadata, .(CT), .fun = function(x){
-  keep = selectGenes(countMatrix[,x$ID], min.count = 10, N = 0.5)
-  names(keep[keep == TRUE])
-})
-# use genes that survive filtering in all cell types
-filt_genes = Reduce(intersect, filt_lst)
-countMatrix_filt = countMatrix[filt_genes,]
-
-# alternatively... less stringent...
-# for all counts data, filter for genes with the CPM equivalent of more than 10 counts in
-# at N proportion of all samples 
-keep = selectGenes(countMatrix, min.count = 10, N = 0.7)
-countMatrix_filt = countMatrix[keep,]
-
-# for each cell type, hierarchically cluster to identify outlier samples 
+# for each cell type, hierarchically cluster 
+# colors are DX groups 
 cut_lst = dlply(metadata, .(CT), .fun = function(x){
-  plotClusters(countMatrix_filt[,x$ID], x, 4, "mcquitty")
+  plotClusters(counts_matrix_filt[,x$ID], x, 4, "ward.D2")
 })
-# remove outlier samples identified by clustering 
-rm_samps = c("Pyr-L5n6-Hu1044.bam","Pyr-L2n3-Hu1044.bam","Pyr-L2n3-Hu1341.bam","Pyr-L2n3-Hu1444.bam")
-countMatrix_filt = select(countMatrix_filt, -rm_samps)
-metadata_filt = metadata[!rownames(metadata) %in% rm_samps,]
 
 ```
 
 # Limma-voom
 ```{r}
 # run custom limma-voom
-res_lst_limma = LimmaVoom(countMatrix_filt, metadata_filt, p.adjust.method = "BH")
+res_lst_limma = LimmaVoom(counts_matrix_filt, metadata, p.adjust.method = "BH", quantile.norm = T, robust.ebayes = F)
 #saveRDS(res_lst_limma, file = "./output/res_lst_limma_acrossCT.rds")
 
 ```
@@ -146,38 +189,279 @@ res_df_limma = bind_rows(res_lst_limma, .id = "cell_type") %>%
   relocate(gene_ensembl, .before = "cell_type") %>%
   dplyr::rename(log2fc = "logFC", pvalue = "P.Value", padj = "adj.P.Val") %>%
   mutate(DX = substring(DX, 3, nchar(DX)))
-#write.csv(res_df_limma, file = "./output/res_df_limma_withinCT.csv")
+# add gene symbols 
+res_df_limma = left_join(res_df_limma, ensembl, by = "gene_ensembl") %>%
+  dplyr::relocate(gene_symbol, .after = gene_ensembl)
 
-# check distribution and median of unadjusted p-values 
-#png(filename = "./output/figures/limma_phist_withinCT.png", width = 11, height = 8, units = "in", res = 600)
+# check distribution of p-values 
+png(filename = "./output/figures/limma.png", width = 10, height = 7, units = "in", res = 600)
+par(mfrow=c(1,2))
 hist(res_df_limma$pvalue)
-#dev.off()
-
+hist(res_df_limma$padj)
+dev.off()
+# median un-adjusted p-values 
 median(res_df_limma$pvalue, na.rm = T)
 
 # count and plot DE genes per cell type and DX group
-plot_df = res_df_limma %>%
+res_df_limma %>%
   group_by(cell_type, DX) %>% 
-  mutate(de_gene_count = sum(padj < 0.1, na.rm = T)) %>%
-  distinct(de_gene_count)
-
-#png(filename = "./output/figures/limma_degs_withinCT.png", width = 11, height = 8, units = "in", res = 600)
-ggplot(plot_df, aes(x = cell_type, y = de_gene_count, fill = cell_type)) +
+  mutate(de_gene_count = sum(padj < 0.05, na.rm = T)) %>%
+  distinct(de_gene_count) %>%
+ggplot(., aes(x = DX, y = de_gene_count, fill = DX)) +
   geom_bar(stat = "identity") +
   theme_minimal() +
   coord_flip() +
-  facet_wrap(~DX, ncol = 1) 
-#dev.off()
+  facet_wrap(~cell_type, ncol = 1) 
+ggsave(filename = "./output/figures/limma.jpeg", width = 10, height = 5.5)
 
 ```
 
-# EdgeR-LRT
 ```{r}
-# run custom edgeR
-#res_lst_edger = EdgeRLRT(countMatrix_filt, metadata_filt, p.adjust.method = "BH")
-#saveRDS(res_lst_edger, file = "./output/res_lst_edger_acrossCT.rds")
+# filter significant genes 
+res_df_limma_sig = res_df_limma %>% dplyr::filter(padj < 0.05)
+length(unique(res_df_limma_sig$gene_symbol))
+#write.csv(res_df_limma_sig, file = "./output/res_df_limma_sig.csv")
+
+# check expression profiles for DE genes 
+for(gene in unique(res_df_limma_sig$gene_ensembl)){
+  
+  gene_name = ensembl %>% filter(gene_ensembl == gene) %>% pull(gene_symbol)
+  cell_types = res_df_limma_sig %>% filter(gene_ensembl == gene) %>% pull(cell_type)
+  disorders = res_df_limma_sig %>% filter(gene_ensembl == gene) %>% pull(DX)
+  
+  plot_exp = edgeR::cpm(counts_matrix_filt+1) %>%
+    as.data.frame() %>%
+    filter(row.names(.) == gene) %>%
+    t() %>% as.data.frame() %>%
+    rownames_to_column(var = "ID") %>%
+    merge(metadata, ., by = "ID") %>%
+    mutate(col = case_when(DX %in% disorders & CT %in% cell_types ~ "de", 
+                           DX == "CTRL" & CT %in% cell_types ~ "ref",
+                           TRUE ~ "not"))
+  names(plot_exp)[ncol(plot_exp)-1] = "exp"
+
+  ggplot(plot_exp, aes(x = DX, y = log2(exp), fill = col)) + 
+    geom_violin() +
+    geom_boxplot(width = 0.3) +
+    labs(title = gene_name, y = "log2 CPM+1", x = "") + 
+    scale_fill_manual(breaks = c("de","not","ref"), values = c("lightcoral","grey","lightblue3"))+
+    theme_classic() + 
+    theme(legend.position = "none") +
+    facet_wrap(~CT, drop = TRUE, scales = "free_x", nrow = 1)
+  ggsave(filename = paste0("./output/figures/expression_plots/limma/",gene_name,".jpeg"), width = 11, height = 6)
+}
 
 ```
+
+# DESeq2
+```{r}
+# run custom DESeq2
+res_lst_deseq2 = DESeq2(counts_matrix_filt, metadata, ind.filt = FALSE, alpha = 0.05, p.adjust.method = "fdr")
+#saveRDS(res_lst_deseq2, file = "./output/res_lst_deseq2_fdr.rds")
+
+```
+
+```{r}
+# read
+res_lst_deseq2 = readRDS(file = "./output/res_lst_deseq2_fdr.rds")
+
+# combine and clean
+res_df_deseq2 = bind_rows(res_lst_deseq2, .id = "cell_type") %>% 
+  relocate(DX, .after = "cell_type") %>% 
+  relocate(gene_ensembl, .before = "cell_type") %>%
+  dplyr::rename(log2fc = "log2FoldChange") %>%
+  tidyr::separate(DX, c("x1","DX","x2","x3"), "_") %>%
+  dplyr::select(-c("x1","x2","x3"))
+# add gene symbols 
+res_df_deseq2 = left_join(res_df_deseq2, ensembl, by = "gene_ensembl") %>%
+  dplyr::relocate(gene_symbol, .after = gene_ensembl)
+# check distribution of p-values 
+png(filename = "./output/figures/deseq2_fdr.png", width = 10, height = 7, units = "in", res = 600)
+par(mfrow=c(1,2))
+hist(res_df_deseq2$pvalue)
+hist(res_df_deseq2$padj)
+dev.off()
+# median un-adjusted p-values 
+median(res_df_deseq2$pvalue, na.rm = T)
+
+# count and plot DE genes per cell type and DX group
+res_df_deseq2 %>%
+  group_by(cell_type, DX) %>% 
+  mutate(de_gene_count = sum(padj < 0.05, na.rm = T)) %>%
+  distinct(de_gene_count) %>%
+ggplot(., aes(x = DX, y = de_gene_count, fill = DX)) +
+  geom_bar(stat = "identity") +
+  theme_minimal() +
+  coord_flip() +
+  facet_wrap(~cell_type, ncol = 1) 
+ggsave(filename = "./output/figures/deseq2_fdr.jpeg", width = 10, height = 5.5)
+
+```
+
+```{r}
+# filter significant genes 
+res_df_deseq2_sig = res_df_deseq2 %>% dplyr::filter(padj < 0.05)
+length(unique(res_df_deseq2_sig$gene_symbol))
+#write.csv(res_df_deseq2_sig, file = "./output/res_df_deseq2_sig.csv")
+
+# check expression profiles for DE genes 
+for(gene in unique(res_df_deseq2_sig$gene_ensembl)){
+  
+  gene_name = ensembl %>% filter(gene_ensembl == gene) %>% pull(gene_symbol)
+  cell_types = res_df_deseq2_sig %>% filter(gene_ensembl == gene) %>% pull(cell_type)
+  disorders = res_df_deseq2_sig %>% filter(gene_ensembl == gene) %>% pull(DX)
+  
+  plot_exp = edgeR::cpm(counts_matrix_filt+1) %>%
+    as.data.frame() %>%
+    filter(row.names(.) == gene) %>%
+    t() %>% as.data.frame() %>%
+    rownames_to_column(var = "ID") %>%
+    merge(metadata, ., by = "ID") %>%
+    mutate(col = case_when(DX %in% disorders & CT %in% cell_types ~ "de", 
+                           DX == "CTRL" & CT %in% cell_types ~ "ref",
+                           TRUE ~ "not"))
+  names(plot_exp)[ncol(plot_exp)-1] = "exp"
+
+  ggplot(plot_exp, aes(x = DX, y = log2(exp), fill = col)) + 
+    geom_violin() +
+    geom_boxplot(width = 0.3) +
+    labs(title = gene_name, y = "log2 CPM+1", x = "") + 
+    scale_fill_manual(breaks = c("de","not","ref"), values = c("lightcoral","grey","lightblue3"))+
+    theme_classic() + 
+    theme(legend.position = "none") +
+    facet_wrap(~CT, drop = TRUE, scales = "free_x", nrow = 1)
+  ggsave(filename = paste0("./output/figures/expression_plots/deseq2/",gene_name,".jpeg"), width = 11, height = 6)
+}
+
+```
+
+
+# 
+```{r}
+
+# load metadata and filter to Pitt institution only 
+cmc_metadata = readRDS(file = "./output/METADATA.rds") %>% filter(Institution == "Pitt")
+# matching expression matrix 
+cmc_counts_matrix = readRDS(file = "./output/geneCountsMerged.rds") %>% dplyr::select(row.names(cmc_metadata))
+# check
+all(rownames(cmc_metadata) == colnames(cmc_metadata)) 
+
+# set factors 
+cmc_metadata$Dx = factor(cmc_metadata$Dx, levels = c("Control","BP","SCZ"), labels = c("CTRL","BD","SCZ"))
+cmc_metadata$Age = scale(cmc_metadata$ageOfDeath, center = TRUE)
+cmc_metadata$Reported_Gender = factor(cmc_metadata$Reported_Gender, levels = c("Male","Female"))
+
+# filter genes 
+keep = rowSums(cpm(cmc_counts_matrix)>1) >= .3*ncol(cmc_counts_matrix)
+cmc_counts_matrix_filt = cmc_counts_matrix[keep,]
+
+# limma-voom
+dge = DGEList(cmc_counts_matrix_filt, group = cmc_metadata$Dx)
+dge = calcNormFactors(dge, method = "TMM")
+
+design = model.matrix(~ 0 + Dx + Age + Reported_Gender + cellFrac_ilr_1 + cellFrac_ilr_2 + cellFrac_ilr_3 , cmc_metadata)
+contrs = makeContrasts(DxBD = DxBD-DxCTRL,
+                       DxSCZ = DxSCZ-DxCTRL, levels = colnames(design))
+
+par(mfrow=c(1,2))
+
+vm = voom(dge, design, plot = TRUE)
+fit = lmFit(vm, design)
+fit = contrasts.fit(fit, contrs)
+fit = eBayes(fit)
+
+plotSA(fit, main = "Final model: Mean-variance trend")
+
+res_BD = topTable(fit, coef = "DxBD", sort = "none", n = Inf, adjust.method = "BH") %>% 
+  rownames_to_column(var = "gene_ensembl") %>%
+  dplyr::rename(log2fc = "logFC", pvalue = "P.Value", padj = "adj.P.Val") %>%
+  tidyr::separate(gene_ensembl, c('gene_ensembl','position'), sep = '\\.')
+hist(res_BD$pvalue)
+median(res_BD$pvalue)
+
+res_SCZ = topTable(fit, coef = "DxSCZ", sort = "none", n = Inf, adjust.method = "BH") %>%
+  rownames_to_column(var = "gene_ensembl") %>%
+  dplyr::rename(log2fc = "logFC", pvalue = "P.Value", padj = "adj.P.Val") %>%
+  tidyr::separate(gene_ensembl, c('gene_ensembl','position'), sep = '\\.')
+hist(res_BD$pvalue)
+median(res_BD$pvalue)
+
+```
+
+```{r, fig.width=5.5, fig.height=2}
+
+cell_types = unique(metadata$CT)
+plot_lst = list()
+
+for(CT in cell_types){
+  plot_t = res_df_limma %>% 
+    filter(cell_type == CT, DX == "BD") %>%
+    merge(., res_BD, by = "gene_ensembl") %>%
+    mutate(density = get_density(t.x, t.y, n = 100))
+  
+  plot_lst[[CT]] = ggplot(plot_t, aes(t.x, t.y, color = density)) +
+    geom_point(shape = 16) + 
+    geom_abline(slope = 1, intercept = 0, color = "red", lwd = 1.0) +
+    geom_smooth(method = "lm", se = FALSE, color = "#114357", lwd = 1.0) +
+    labs(title = paste0(CT, "-BD"), x = "LCM t-statistic", y = "Bulk t-statistic") + 
+    scale_color_viridis() +
+    stat_cor(method = "spearman", label.y = 10, label.x = -10, size = 3) +
+    theme_classic() +
+    theme(legend.position = "none")
+}
+png(filename = "./output/figures/BD_tstats.png", width = 17, height = 6, units = "in", res = 600)
+do.call(grid.arrange, c(plot_lst, ncol = 5))
+dev.off()
+
+for(CT in cell_types){
+  plot_t = res_df_limma %>% 
+    filter(cell_type == CT, DX == "SCZ") %>%
+    merge(., res_SCZ, by = "gene_ensembl") %>%
+    mutate(density = get_density(t.x, t.y, n = 100))
+  
+  plot_lst[[CT]] = ggplot(plot_t, aes(t.x, t.y, color = density)) +
+    geom_point(shape = 16) + 
+    geom_abline(slope = 1, intercept = 0, color = "red", lwd = 1.0) +
+    geom_smooth(method = "lm", se = FALSE, color = "#114357", lwd = 1.0) +
+    labs(title = paste0(CT, "-SCZ"), x = "LCM t-statistic", y = "Bulk t-statistic") + 
+    scale_color_viridis() +
+    stat_cor(method = "spearman", label.y = 10, label.x = -10, size = 3) +
+    theme_classic() +
+    theme(legend.position = "none")
+}
+png(filename = "./output/figures/SCZ_tstats.png", width = 17, height = 6, units = "in", res = 600)
+do.call(grid.arrange, c(plot_lst, ncol = 5))
+dev.off()
+
+```
+
+```{r}
+
+exons = as.matrix(counts_exon)
+dim(exons)
+introns = as.matrix(counts_intron)
+
+comb = exons+introns
+dim(comb)
+
+df = data.frame(exons = colSums(exons),
+                comb = colSums(comb)) %>%
+                  mutate(ratio = exons/comb)
+
+ggplot(df, aes(x = log10(exons), y = log10(comb))) +
+  geom_point() +
+  geom_abline(slope = 1) 
+
+hist(df$ratio)
+
+
+```
+
+
+
+
+
+
 
 
 

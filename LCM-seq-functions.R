@@ -20,6 +20,7 @@ suppressPackageStartupMessages({
   library(cowplot)
   library(RColorBrewer)
   library(dendextend)
+  library(biomaRt)
 })
 
 # for parallel processing
@@ -56,6 +57,34 @@ selectGenes = function(counts, min.count = 10, N = 0.25){
   return(keep)
 }
 
+#' Plot mean vs. standard-deviation relationship
+#'
+#' @param data data matrix where columns represent samples to be clustered
+#' 
+#' @return ggplot 
+plotMeanSD = function(data, stabilized){ 
+
+  p_mean_sd =
+    p_df = data %>% 
+    as.data.frame() %>% 
+    rownames_to_column("gene") %>% 
+    pivot_longer(cols = - gene, names_to = "sample", values_to = "counts") %>% 
+    dplyr::group_by(gene) %>% 
+    dplyr::summarise(gene_average = mean(counts), gene_stdev = sd(counts)) %>% 
+    ungroup()
+    if(stabilized == TRUE) {
+      p = ggplot(p_df, aes(x = gene_average, y = gene_stdev)) 
+    } else {
+      p =  ggplot(p_df, aes(x = log10(gene_average), y = log10(gene_stdev))) 
+    }
+    p = p + geom_point(alpha = 0.5, fill = "grey", colour = "black") +
+    labs(x = "Gene count average", 
+         y = "Gene count standard deviation") +
+    ggtitle("Mean - Standard deviation relationship")
+  
+  return(p)
+}
+
 #' Hierarchical clustering for removing outlier samples 
 #'
 #' @param data data matrix where columns represent samples to be clustered
@@ -64,7 +93,7 @@ selectGenes = function(counts, min.count = 10, N = 0.25){
 #' @param method the agglomeration method to be used, one of "ward.D", "ward.D2", "single", "complete", 
 #' "average" (= UPGMA), "mcquitty" (= WPGMA), "median" (= WPGMC) or "centroid" (= UPGMC).
 #'
-#' @return ggplot of clusters 
+#' @return dendrogram with leafs colored  by DX, and dataframe of cluster membership 
 plotClusters = function(data, metadata, cluster.number, method){  
   
   if(ncol(data) < nrow(data)) data = t(data)
@@ -114,16 +143,29 @@ plotDims = function(data, metadata, variable, method = "UMAP", ellipses = FALSE,
     res = Rtsne(data)
     res = data.frame(ID = sample_ids, X = res$Y[,1], Y = res$Y[,2])
   } 
-  plotdata = left_join(metadata %>% select(c(variable,"ID")), res, 'ID')
+  plotdata = left_join(metadata %>% dplyr::select(c(variable,"ID")), res, 'ID')
   names(plotdata)[1] = "var"
   
   p = ggplot(plotdata, aes(x = X, y = Y)) +
-      geom_point(aes(color = var)) + 
+      geom_point(aes(color = var), shape = 16) + 
       theme_minimal() 
   if(ellipses == TRUE) p + stat_ellipse(aes(color = var), level = 0.3)
   if(legend == FALSE) p + theme(legend.position = "none")
   
   return(p)
+}
+
+# Get density of points in 2 dimensions.
+# @param x A numeric vector.
+# @param y A numeric vector.
+# @param n Create a square n by n grid to compute density.
+# @return The density within each square.
+get_density = function(x, y, ...) {
+  dens = MASS::kde2d(x, y, ...)
+  ix = findInterval(x, dens$x)
+  iy = findInterval(y, dens$y)
+  ii = cbind(ix, iy)
+  return(dens$z[ii])
 }
 
 #' DESeq2 within each cell type 
@@ -134,26 +176,21 @@ plotDims = function(data, metadata, variable, method = "UMAP", ellipses = FALSE,
 #' @param p.adjust.method method used to adjust the p-values for multiple testing. Options, in increasing conservatism, include "none", "BH", "BY" and "holm"
 #' 
 #' @return list of differential expression testing results 
-DESeq2 = function(counts, metadata, ind.filt = FALSE, p.adjust.method = "BH"){
+DESeq2 = function(counts, metadata, ind.filt = FALSE, alpha = 0.05, p.adjust.method = "BH"){
   
-  i = 0
   res_lst = dlply(metadata, .(CT), .fun = function(x){
     
-    print(paste0(i+1, ": ", as.character(unique(x$CT))))
-    
-    dds = DESeqDataSetFromMatrix(countData = counts[,x$ID], colData = x, design = ~ Age_std + Sex + DX)
+    dds = DESeqDataSetFromMatrix(countData = counts[,x$ID], colData = x, design = ~ Age_scaled + Sex + DX)
     dds = DESeq(dds, parallel = TRUE, BPPARAM = param, quiet = TRUE)
     
     contrasts = resultsNames(dds)[-c(1:3)]
     
     tmp_lst = lapply(contrasts, function(z){
       
-      res = results(dds, name = z, independentFiltering = ind.filt, pAdjustMethod = p.adjust.method)
+      res = results(dds, name = z, independentFiltering = ind.filt, alpha = alpha, pAdjustMethod = p.adjust.method)
       res = as.data.frame(res) %>% rownames_to_column(var = "gene_ensembl")
       res$DX = z
       
-      print(hist(res$pvalue))
-      print(median(res$pvalue))
       return(res)
     })
     res = do.call(rbind, tmp_lst)
@@ -170,40 +207,46 @@ DESeq2 = function(counts, metadata, ind.filt = FALSE, p.adjust.method = "BH"){
 #' @param p.adjust.method method used to adjust the p-values for multiple testing. Options, in increasing conservatism, include "none", "BH", "BY" and "holm"
 #' 
 #' @return list of differential expression testing results 
-LimmaVoom = function(counts, metadata, p.adjust.method = "BH"){
+LimmaVoom = function(counts, metadata, p.adjust.method = "BH", robust.ebayes = TRUE, quantile.norm = TRUE){
   
-  i = 0
   res_lst = dlply(metadata, .(CT), .fun = function(x){
     
-    print(paste0(i+1, ": ", as.character(unique(x$CT))))
+    print(as.character(unique(x$CT)))
     
     dge = DGEList(counts[x$ID], group = x$DX)
-    dge = calcNormFactors(dge, method = "TMM")
+    if(quantile.norm == TRUE) { 
+      dge = calcNormFactors(dge, method = "none")
+    } else {
+      dge = calcNormFactors(dge, method = "TMM")
+    }
     
-    design = model.matrix(~ 0 + DX + Age_std + Sex, x)
+    design = model.matrix(~ 0 + DX + Age_scaled + Sex, x)
     contrs = makeContrasts(DXMDD = DXMDD-DXCTRL,
                            DXBD = DXBD-DXCTRL,
                            DXSCZ = DXSCZ-DXCTRL,
                            levels = colnames(design))
+        par(mfrow=c(1,2))
     
-    par(mfrow=c(1,2))
-    
-    vm = voom(dge, design, plot = TRUE)
-
+    if(quantile.norm == TRUE){ 
+      vm = voom(dge, design, plot = TRUE, normalize.method = "quantile")
+    } else {
+      vm = voom(dge, design, plot = TRUE)
+    }
+        
     fit = lmFit(vm, design)
     fit = contrasts.fit(fit, contrs)
-    fit = eBayes(fit)
+    fit = eBayes(fit, robust = robust.ebayes)
     
-    plotSA(fit, main = "Final model: Mean-variance trend")
-    
-    lcpm = edgeR::cpm(dge, log = TRUE)
-    boxplot(lcpm, las = 2, main = "")
-    title(main = paste0("calNormFactors\n",as.character(unique(x$CT))), ylab = "Log-cpm")
-    
-    boxplot(vm$E, las = 2, main = "")
-    title(main = paste0("voom\n",as.character(unique(x$CT))), ylab = "Log-cpm")
-    
-    print(summary(decideTests(fit, p.value = 0.1, adjust.method = p.adjust.method)))
+        plotSA(fit, main = "Final model: Mean-variance trend")
+      
+        lcpm = edgeR::cpm(dge, log = TRUE)
+        boxplot(lcpm, las = 2, main = "")
+        title(main = paste0("calNormFactors\n",as.character(unique(x$CT))), ylab = "Log-cpm")
+        
+        boxplot(vm$E, las = 2, main = "")
+        title(main = paste0("voom\n",as.character(unique(x$CT))), ylab = "Log-cpm")
+        
+        print(summary(decideTests(fit, p.value = 0.1, adjust.method = p.adjust.method)))
     
     contrasts = colnames(contrs)
     tmp_lst = lapply(contrasts, function(x){
@@ -235,7 +278,7 @@ EdgeRLRT = function(counts, metadata, p.adjust.method = "BH"){
     dge = DGEList(counts[x$ID], group = x$DX)
     dge = calcNormFactors(dge, method = "TMM")
     
-    design = model.matrix(~ 0 + DX + Age_std + Sex, x)
+    design = model.matrix(~ 0 + DX + Age_scaled + Sex, x)
     contrs = makeContrasts(DXMDD = DXMDD-DXCTRL,
                            DXBD = DXBD-DXCTRL,
                            DXSCZ = DXSCZ-DXCTRL,
